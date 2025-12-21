@@ -9,12 +9,16 @@ This is a fork of the [FFmpeg](https://ffmpeg.org) project that adds support for
 ## Usage
 
 ```bash
-ffplay -f whep -token <token> <whep_url>
+ffplay -f whep -token <token> http://myip/api/whep_endpoint
+```
+or
+```bash
+ffplay  -token <token> whep://myip/api/whep_endpoint
 ```
 
 ## Building
 
-1. Build **libdatachannel** by following the instructions in its [BUILDING.md](https://github.com/paullouisageneau/libdatachannel/blob/master/BUILDING.md).
+1. Build **libdatachannel** by following the instructions in its [BUILDING.md](https://github.com/467815891a/libdatachannel/blob/master/BUILDING.md).
 
 2. Install **libdatachannel** to the system directory using `make install`.
 

@@ -27,6 +27,9 @@
 
 #include "whip_whep.h"
 
+/* Register WHEP protocol handler */
+// WHEP protocol is now registered in whep.c instead of here
+
 // Convert libdatachannel log level to equivalent ffmpeg log level.
 static int libdatachannel_to_ffmpeg_log_level(int libdatachannel_log_level)
 {
@@ -55,8 +58,23 @@ int ff_whip_whep_exchange_and_set_sdp(AVFormatContext *s, int pc, const char *to
     AVDictionary *options = NULL;
     AVIOContext *io_ctx = NULL;
     int ret;
+    char *http_url = NULL;
 
-    if (!av_strstart(s->url, "http", NULL)) {
+    av_log(s, AV_LOG_INFO, "Starting WHEP SDP exchange with URL: %s\n", s->url);
+    
+    // Convert whep:// to http:// for the actual HTTP request
+    if (av_strstart(s->url, "whep://", NULL)) {
+        http_url = av_malloc(strlen(s->url) + 1);
+        if (!http_url) {
+            av_log(s, AV_LOG_ERROR, "Failed to allocate memory for HTTP URL\n");
+            return AVERROR(ENOMEM);
+        }
+        strcpy(http_url, "http://");
+        strcat(http_url, s->url + 7); // Skip "whep://"
+        av_log(s, AV_LOG_INFO, "Converted WHEP URL to HTTP: %s\n", http_url);
+    } else if (av_strstart(s->url, "http", NULL)) {
+        http_url = av_strdup(s->url);
+    } else {
         av_log(s, AV_LOG_ERROR, "Unsupported URL scheme\n");
         return AVERROR(EINVAL);
     }
@@ -85,9 +103,10 @@ int ff_whip_whep_exchange_and_set_sdp(AVFormatContext *s, int pc, const char *to
         av_free(headers);
     }
 
-    ret = avio_open2(&io_ctx, s->url, AVIO_FLAG_READ, NULL, &options);
+    av_log(s, AV_LOG_INFO, "Sending SDP offer to URL: %s\n", http_url);
+    ret = avio_open2(&io_ctx, http_url, AVIO_FLAG_READ, NULL, &options);
     if (ret < 0) {
-        av_log(s, AV_LOG_ERROR, "Failed to send offer to endpoint: %s\n", av_err2str(ret));
+        av_log(s, AV_LOG_ERROR, "Failed to send offer to endpoint: %s (%s)\n", http_url, av_err2str(ret));
         goto fail;
     }
 
@@ -95,11 +114,14 @@ int ff_whip_whep_exchange_and_set_sdp(AVFormatContext *s, int pc, const char *to
     if (ret <= 0) {
         av_log(s, AV_LOG_ERROR, "Failed to read answer: %s\n",
                av_err2str(ret));
-        ret = AVERROR(EIO);
+        if (ret == 0) {
+            av_log(s, AV_LOG_ERROR, "No data received from server\n");
+            ret = AVERROR(EIO);
+        }
         goto fail;
     }
     answer[ret] = 0;
-    av_log(s, AV_LOG_DEBUG, "Received answer: %s\n", answer);
+    av_log(s, AV_LOG_INFO, "Received answer: %s\n", answer);
 
     if (rtcSetRemoteDescription(pc, answer, "answer") < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to set remote description: %s\n", answer);
@@ -107,13 +129,21 @@ int ff_whip_whep_exchange_and_set_sdp(AVFormatContext *s, int pc, const char *to
         goto fail;
     }
 
-    if (session_url)
-        av_opt_get(io_ctx, "new_location", AV_OPT_SEARCH_CHILDREN, (uint8_t **)session_url);
+    if (session_url) {
+        ret = av_opt_get(io_ctx, "new_location", AV_OPT_SEARCH_CHILDREN, (uint8_t **)session_url);
+        if (ret < 0) {
+            av_log(s, AV_LOG_WARNING, "Failed to get session URL: %s\n", av_err2str(ret));
+            *session_url = NULL;
+        } else {
+            av_log(s, AV_LOG_INFO, "Session URL: %s\n", *session_url ? *session_url : "none");
+        }
+    }
 
     ret = 0;
 fail:
     avio_closep(&io_ctx);
     av_dict_free(&options);
+    av_free(http_url);
     return ret;
 }
 
@@ -122,13 +152,27 @@ int ff_whip_whep_delete_session(AVFormatContext *s, const char *token, const cha
     AVDictionary *options = NULL;
     AVIOContext *io_ctx = NULL;
     int ret;
+    char *http_url = NULL;
 
     if (!session_url) {
         av_log(s, AV_LOG_ERROR, "No session URL provided\n");
         return AVERROR(EINVAL);
     }
-    if (!av_strstart(session_url, "http", NULL)) {
-        av_log(s, AV_LOG_ERROR, "Unsupported URL scheme\n");
+    
+    // Convert whep:// to http:// for the actual HTTP request
+    if (av_strstart(session_url, "whep://", NULL)) {
+        http_url = av_malloc(strlen(session_url) + 1);
+        if (!http_url) {
+            av_log(s, AV_LOG_ERROR, "Failed to allocate memory for HTTP URL\n");
+            return AVERROR(ENOMEM);
+        }
+        strcpy(http_url, "http://");
+        strcat(http_url, session_url + 7); // Skip "whep://"
+        av_log(s, AV_LOG_INFO, "Converted WHEP URL to HTTP for DELETE: %s\n", http_url);
+    } else if (av_strstart(session_url, "http", NULL)) {
+        http_url = av_strdup(session_url);
+    } else {
+        av_log(s, AV_LOG_ERROR, "Unsupported URL scheme: %s\n", session_url);
         return AVERROR(EINVAL);
     }
 
@@ -137,17 +181,20 @@ int ff_whip_whep_delete_session(AVFormatContext *s, const char *token, const cha
         char* headers = av_asprintf("Authorization: Bearer %s\r\n", token);
         if (!headers) {
             av_log(s, AV_LOG_ERROR, "Failed to allocate headers\n");
+            av_free(http_url);
             return AVERROR(ENOMEM);
         }
         av_dict_set(&options, "headers", headers, 0);
         av_free(headers);
     }
-    ret = avio_open2(&io_ctx, session_url, AVIO_FLAG_READ, NULL, &options);
+    ret = avio_open2(&io_ctx, http_url, AVIO_FLAG_READ, NULL, &options);
     if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Failed to delete session: %s\n", av_err2str(ret));
     }
 
     avio_closep(&io_ctx);
     av_dict_free(&options);
+    av_free(http_url);
     return ret;
 }
+

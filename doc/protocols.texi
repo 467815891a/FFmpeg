@@ -617,6 +617,36 @@ is used for reading large video packets with small audio packets in between.
 
 Some HTTP requests will be denied unless cookie values are passed in with the
 request. The @option{cookies} option allows these cookies to be specified. At
+
+@section whep
+
+WHEP (WebRTC-HTTP Egress Protocol).
+
+This protocol provides support for WebRTC-HTTP Egress Protocol as defined in
+@url{https://datatracker.ietf.org/doc/html/draft-murillo-whep-02}.
+
+The WHEP protocol can be used in two ways:
+1. Directly with the "whep://" prefix, which will automatically handle the
+   WebRTC negotiation and stream reception.
+2. With the traditional "demuxer+http://" syntax for compatibility.
+
+Examples:
+@example
+ffmpeg -i whep://http://example.com/whep/endpoint -c copy output.mp4
+ffmpeg -i demuxer+http://whep=http://example.com/whep/endpoint -c copy output.mp4
+@end example
+
+This protocol accepts the same options as the HTTP protocol, with the following
+additions:
+
+@table @option
+@item token
+Set the token to send in the Authorization header as "Bearer <token>".
+
+@item pli_period
+Set interval in seconds for sending periodic PLI (Picture Loss Indication)
+requests; 0 to disable. Default is 0 (disabled).
+@end table
 the very least, each cookie must specify a value along with a path and domain.
 HTTP requests that match both the domain and path will automatically include the
 cookie value in the HTTP Cookie header field. Multiple cookies can be delimited

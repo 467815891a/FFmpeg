@@ -23,6 +23,7 @@
 #include <stdatomic.h>
 #include "avformat.h"
 #include "demux.h"
+#include "url.h"
 #include "libavcodec/codec_id.h"
 #include "libavutil/avstring.h"
 #include "libavutil/opt.h"
@@ -45,6 +46,8 @@ static const struct {
   {98, "H264", AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_H264, 90000, -1},
   {99, "H265", AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_H265, 90000, -1},
   {111, "OPUS", AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_OPUS, 48000, 2},
+  {0, "PCMU", AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_PCM_MULAW, 8000, 1},
+  {8, "PCMA", AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_PCM_ALAW, 8000, 1},
   {-1, "", AVMEDIA_TYPE_UNKNOWN, AV_CODEC_ID_NONE, -1, -1}
 };
 
@@ -240,7 +243,7 @@ static void message_callback(int id, const char *message, int size, void *ptr)
     if (size < 2)
         return;
 
-    if (RTP_PT_IS_RTCP(message[1]) && size < 8 || size < 12)
+    if ((RTP_PT_IS_RTCP(message[1]) && size < 8) || size < 12)
         return;
 
     // Push packet to ring buffer
@@ -262,11 +265,23 @@ static void message_callback(int id, const char *message, int size, void *ptr)
     next         = (current_tail + 1) % whep->capacity;
     current_head = atomic_load_explicit(&whep->head, memory_order_acquire);
 
+    // If buffer is full, wait for space to become available
     if (next == current_head) {
-        av_log(whep, AV_LOG_ERROR, "Message buffer is full\n");
-        av_free(msg->data);
-        av_free(msg);
-        return;
+        av_log(whep, AV_LOG_WARNING, "Message buffer is full, waiting for space\n");
+        int attempts = 0;
+        while (next == current_head && attempts < 100) {  // Max 100 attempts (~1 second)
+            av_usleep(10000);  // Wait 10ms
+            current_head = atomic_load_explicit(&whep->head, memory_order_acquire);
+            attempts++;
+        }
+        
+        // If still full after waiting, drop the packet
+        if (next == current_head) {
+            av_log(whep, AV_LOG_ERROR, "Message buffer still full after waiting, dropping packet\n");
+            av_free(msg->data);
+            av_free(msg);
+            return;
+        }
     }
 
     whep->buffer[current_tail] = msg;
@@ -281,12 +296,50 @@ static int whep_read_header(AVFormatContext *s)
     ff_whip_whep_init_rtc_logger();
     s->ctx_flags |= AVFMTCTX_NOHEADER;
 
-    whep->capacity = 1024;
+    av_log(s, AV_LOG_INFO, "WHEP demuxer opening URL: %s\n", s->url);
+    
+    // Log information about the AVIOContext
+    const char *original_url = s->url; // Save original URL for restoration
+    if (s->pb) {
+        av_log(s, AV_LOG_INFO, "AVIOContext exists, checking protocol context\n");
+        if (s->pb->opaque) {
+            URLContext *uc = (URLContext *)s->pb->opaque;
+            av_log(s, AV_LOG_INFO, "URLContext exists\n");
+            if (uc->prot) {
+                av_log(s, AV_LOG_INFO, "URLProtocol exists: %s\n", uc->prot->name ? uc->prot->name : "unknown");
+                if (uc->prot->name && !strcmp(uc->prot->name, "whep")) {
+                    av_log(s, AV_LOG_INFO, "Detected WHEP protocol\n");
+                    // Use the HTTP URL stored in the protocol context
+                    if (uc->priv_data) {
+                        av_log(s, AV_LOG_INFO, "Using WHEP protocol URL: %s\n", (char *)uc->priv_data);
+                        // Temporarily override the URL for the SDP exchange
+                        s->url = (char *)uc->priv_data;
+                        av_log(s, AV_LOG_INFO, "URL overridden for SDP exchange: %s\n", s->url);
+                    } else {
+                        av_log(s, AV_LOG_WARNING, "WHEP protocol detected but no URL stored\n");
+                    }
+                } else {
+                    av_log(s, AV_LOG_INFO, "Not using WHEP protocol\n");
+                }
+            } else {
+                av_log(s, AV_LOG_INFO, "URLProtocol is NULL\n");
+            }
+        } else {
+            av_log(s, AV_LOG_INFO, "URLContext is NULL\n");
+        }
+    } else {
+        av_log(s, AV_LOG_INFO, "AVIOContext is NULL\n");
+    }
+
+    // Increased buffer capacity to handle high packet rate streams
+    whep->capacity = 4096;  // Increased from 1024 to 4096
     whep->buffer = av_calloc(whep->capacity, sizeof(*whep->buffer));
     if (!whep->buffer) {
         av_log(s, AV_LOG_ERROR, "Failed to allocate message buffer\n");
         return AVERROR(ENOMEM);
     }
+    
+    av_log(s, AV_LOG_INFO, "Initializing WHEP context with buffer capacity: %d\n", whep->capacity);
     // Initialize WebRTC peer connection
     whep->pc = rtcCreatePeerConnection(&config);
     if (whep->pc <= 0) {
@@ -318,7 +371,32 @@ static int whep_read_header(AVFormatContext *s)
         return AVERROR_EXTERNAL;
     }
 
-    return ff_whip_whep_exchange_and_set_sdp(s, whep->pc, whep->token, &whep->session_url);
+    av_log(s, AV_LOG_INFO, "Starting SDP exchange with URL: %s\n", s->url);
+    
+    int ret = ff_whip_whep_exchange_and_set_sdp(s, whep->pc, whep->token, &whep->session_url);
+    
+    if (ret < 0) {
+        av_log(s, AV_LOG_ERROR, "SDP exchange failed with error: %s\n", av_err2str(ret));
+        return ret;
+    }
+    
+    av_log(s, AV_LOG_INFO, "SDP exchange completed successfully\n");
+    
+    // Restore the original URL if it was overridden
+    // This is important for proper cleanup and future operations
+    if (s->url != original_url) {
+        av_log(s, AV_LOG_INFO, "Restoring original URL\n");
+        s->url = original_url;
+    }
+    
+    // Initialize atomic variables
+    atomic_init(&whep->head, 0);
+    atomic_init(&whep->tail, 0);
+    
+    // Force immediate PLI request for video stream to ensure proper decoding
+    whep->last_pli_time = 0;
+    
+    return 0; // Success
 }
 
 static int whep_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -332,6 +410,12 @@ static int whep_read_packet(AVFormatContext *s, AVPacket *pkt)
         whep->audio_pkt = av_packet_alloc();
     if (!whep->video_pkt)
         whep->video_pkt = av_packet_alloc();
+        
+    // Reset packets if they already exist
+    if (whep->audio_pkt)
+        av_packet_unref(whep->audio_pkt);
+    if (whep->video_pkt)
+        av_packet_unref(whep->video_pkt);
 
 redo:
     rtp_ctx = NULL;
@@ -347,15 +431,31 @@ redo:
     current_head = atomic_load_explicit(&whep->head, memory_order_relaxed);
     current_tail = atomic_load_explicit(&whep->tail, memory_order_acquire);
 
-    if (current_head == current_tail)  // empty
-        return AVERROR(EAGAIN);
+    // If buffer is empty, wait for data to become available
+    if (current_head == current_tail) {  // empty
+        int attempts = 0;
+        while (current_head == current_tail && attempts < 100) {  // Max 100 attempts (~1 second)
+            av_usleep(10000);  // Wait 10ms
+            current_head = atomic_load_explicit(&whep->head, memory_order_acquire);
+            current_tail = atomic_load_explicit(&whep->tail, memory_order_acquire);
+            attempts++;
+        }
+        
+        // If still empty after waiting, return EAGAIN
+        if (current_head == current_tail) {
+            return AVERROR(EAGAIN);
+        }
+    }
+    
     msg = whep->buffer[current_head];
     atomic_store_explicit(&whep->head, (current_head + 1) % whep->capacity,
                          memory_order_release);
+                         
+    av_log(s, AV_LOG_DEBUG, "Processing RTP packet, track=%d, size=%d\n", msg->track, msg->size);
 
     if (RTP_PT_IS_RTCP(msg->data[1])) {
         switch(msg->data[1]) {
-        case RTCP_SR:
+        case RTCP_SR: {
             uint32_t ssrc = (msg->data[4] << 24) | (msg->data[5] << 16) | (msg->data[6] << 8) | msg->data[7];
             for (int i = 0; i < whep->rtp_ctxs_count; i++) {
                 if (whep->rtp_ctxs[i]->ssrc == ssrc) {
@@ -374,6 +474,7 @@ redo:
                 av_free(dyn_buf);
             }
             break;
+        }
         default:
             goto redo;
         }
@@ -398,9 +499,17 @@ redo:
                 }
             }
             if (ret == 0) {
-                av_log(s, AV_LOG_DEBUG, "Create RTP context for payload type %d\n", payload_type);
-                rtp_ctx = whep_new_rtp_context(s, payload_type);
+            av_log(s, AV_LOG_INFO, "Creating RTP context for payload type %d\n", payload_type);
+            rtp_ctx = whep_new_rtp_context(s, payload_type);
+            
+            // Ensure proper codec parameters initialization
+            if (rtp_ctx && rtp_ctx->dynamic_protocol_context) {
+                // Force keyframe request for video streams to ensure proper decoding
+                if (msg->track == whep->video_track) {
+                    whep->last_pli_time = 0;  // Force immediate PLI request
+                }
             }
+        }
         }
     }
 
@@ -414,6 +523,30 @@ redo:
         ret = ff_rtp_parse_packet(rtp_ctx, whep->audio_pkt, (uint8_t **)&msg->data, msg->size) < 0;
     else if (msg->track == whep->video_track)
         ret = ff_rtp_parse_packet(rtp_ctx, whep->video_pkt, (uint8_t **)&msg->data, msg->size) < 0;
+
+    // Handle H.264 specific errors by requesting keyframe
+    if (ret != 0 && msg->track == whep->video_track && 
+        rtp_ctx->handler && rtp_ctx->handler->codec_id == AV_CODEC_ID_H264) {
+        av_log(s, AV_LOG_WARNING, "H.264 decoding error detected, forcing keyframe request\n");
+        // Force immediate keyframe request
+        whep->last_pli_time = 0;
+        
+        // Also trigger immediate PLI sending
+        int64_t now = av_gettime_relative();
+        uint32_t source_ssrc = rtp_ctx->ssrc;
+        uint32_t sender_ssrc = source_ssrc + 1;
+        uint8_t pli_packet[] = {
+            (RTP_VERSION << 6) | 1, RTCP_PSFB,         0x00,             0x02,
+            sender_ssrc >> 24,      sender_ssrc >> 16, sender_ssrc >> 8, sender_ssrc,
+            source_ssrc >> 24,      source_ssrc >> 16, source_ssrc >> 8, source_ssrc,
+        };
+        if (rtcSendMessage(msg->track, pli_packet, sizeof(pli_packet)) < 0) {
+            av_log(s, AV_LOG_ERROR, "Failed to send immediate PLI for H.264 error\n");
+        } else {
+            av_log(s, AV_LOG_INFO, "Sent immediate PLI for H.264 error\n");
+            whep->last_pli_time = now;
+        }
+    }
 
     // Send RTCP feedback
     if (avio_open_dyn_buf(&dyn_bc) == 0) {
@@ -429,9 +562,16 @@ redo:
     // Send PLI
     if (msg->track == whep->video_track && rtp_ctx->ssrc) {
         int64_t now = av_gettime_relative();
-        if ((whep->pli_period && now - whep->last_pli_time >= whep->pli_period * 1000000) ||
-            (rtp_ctx->handler && rtp_ctx->handler->need_keyframe &&
-            rtp_ctx->handler->need_keyframe(rtp_ctx->dynamic_protocol_context))) {
+        // Check if we should send PLI:
+        // 1. Periodic PLI if enabled
+        // 2. Handler requests keyframe
+        // 3. Forced keyframe request (when last_pli_time is 0)
+        int should_send_pli = (whep->pli_period && now - whep->last_pli_time >= whep->pli_period * 1000000) ||
+                              (rtp_ctx->handler && rtp_ctx->handler->need_keyframe &&
+                               rtp_ctx->handler->need_keyframe(rtp_ctx->dynamic_protocol_context)) ||
+                              (whep->last_pli_time == 0);
+                                
+        if (should_send_pli) {
             uint32_t source_ssrc = rtp_ctx->ssrc;
             uint32_t sender_ssrc = source_ssrc + 1;
             uint8_t pli_packet[] = {
@@ -439,10 +579,12 @@ redo:
                 sender_ssrc >> 24,      sender_ssrc >> 16, sender_ssrc >> 8, sender_ssrc,
                 source_ssrc >> 24,      source_ssrc >> 16, source_ssrc >> 8, source_ssrc,
             };
-            if (rtcSendMessage(msg->track, pli_packet, sizeof(pli_packet)) < 0)
+            if (rtcSendMessage(msg->track, pli_packet, sizeof(pli_packet)) < 0) {
                 av_log(s, AV_LOG_ERROR, "Failed to send PLI\n");
-            else
+            } else {
+                av_log(s, AV_LOG_INFO, "Sent PLI request for keyframe\n");
                 whep->last_pli_time = now;
+            }
         }
     }
 
@@ -450,11 +592,14 @@ redo:
         goto redo;
 
     if (msg->track == whep->audio_track) {
-        av_packet_ref(pkt, whep->audio_pkt);
-        av_packet_free(&whep->audio_pkt);
+        av_packet_move_ref(pkt, whep->audio_pkt);
+        // Fix potential audio timestamp issues
+        if (pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE && pkt->pts < pkt->dts) {
+            av_log(s, AV_LOG_WARNING, "Correcting invalid audio PTS: %"PRId64" -> %"PRId64"\n", pkt->pts, pkt->dts);
+            pkt->pts = pkt->dts;
+        }
     } else if (msg->track == whep->video_track) {
-        av_packet_ref(pkt, whep->video_pkt);
-        av_packet_free(&whep->video_pkt);
+        av_packet_move_ref(pkt, whep->video_pkt);
     }
     av_free(msg->data);
     av_free(msg);
@@ -518,6 +663,55 @@ static int whep_read_close(AVFormatContext *s)
     return 0;
 }
 
+static int whep_url_open(URLContext *h, const char *uri, int flags)
+{
+    av_log(h, AV_LOG_INFO, "WHEP protocol opening URI: %s\n", uri);
+    
+    // For whep:// URLs, we need to let the demuxer know the actual HTTP endpoint
+    // We'll store the HTTP URL in priv_data so the demuxer can access it
+    if (!av_strstart(uri, "whep://", NULL)) {
+        av_log(h, AV_LOG_ERROR, "Unsupported URL scheme\n");
+        return AVERROR(EINVAL);
+    }
+    
+    // Calculate the length needed for the HTTP URL
+    // whep://host/path -> http://host/path
+    size_t whep_len = strlen(uri);
+    size_t http_len = whep_len; // Same length since "whep" and "http" are both 4 characters
+    
+    // Store the HTTP URL (replace "whep://" with "http://")
+    h->priv_data = av_malloc(http_len + 1); // +1 for null terminator
+    if (!h->priv_data)
+        return AVERROR(ENOMEM);
+        
+    strcpy(h->priv_data, "http://");
+    strcat(h->priv_data, uri + 7); // Skip "whep://"
+    
+    av_log(h, AV_LOG_INFO, "WHEP protocol will use endpoint: %s\n", (char *)h->priv_data);
+    
+    // We don't actually open a connection here - the demuxer will handle that
+    return 0;
+}
+
+static int whep_url_read(URLContext *h, unsigned char *buf, int size)
+{
+    // For WHEP protocol, we don't read data through this interface
+    // The demuxer handles all data through WebRTC
+    // Return EOF to indicate that there's no data to read through this interface
+    return AVERROR_EOF;
+}
+
+static int whep_url_close(URLContext *h)
+{
+    av_log(h, AV_LOG_INFO, "Closing WHEP protocol\n");
+    
+    // Clean up resources
+    av_free(h->priv_data);
+    h->priv_data = NULL;
+    
+    return 0;
+}
+
 #define OFFSET(x) offsetof(WHEPContext, x)
 static const AVOption whep_options[] = {
     { "token", "set token to send in the Authorization header as \"Bearer <token>\"",
@@ -534,14 +728,30 @@ static const AVClass whep_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
+static int whep_probe(const AVProbeData *p) {
+    if (p->filename && strstr(p->filename, "whep://")) {
+        return AVPROBE_SCORE_MAX / 2;
+    }
+    return 0;
+}
+
 const FFInputFormat ff_whep_demuxer = {
     .p.name         = "whep",
     .p.long_name    = NULL_IF_CONFIG_SMALL("WHEP (WebRTC-HTTP Egress Protocol)"),
     .p.flags        = AVFMT_NOFILE,
     .p.priv_class   = &whep_class,
+    .read_probe     = whep_probe,
     .priv_data_size = sizeof(WHEPContext),
     .read_header    = whep_read_header,
     .read_packet    = whep_read_packet,
     .read_close     = whep_read_close,
     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
+};
+
+const URLProtocol ff_whep_protocol = {
+    .name           = "whep",
+    .url_open       = whep_url_open,
+    .url_read       = whep_url_read,
+    .url_close      = whep_url_close,
+    .flags          = URL_PROTOCOL_FLAG_NESTED_SCHEME,
 };
