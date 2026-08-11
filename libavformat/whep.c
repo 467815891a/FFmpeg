@@ -29,6 +29,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 #include "rtpdec.h"
+#include "url.h"
 #include "whip_whep.h"
 
 static const struct {
@@ -91,6 +92,7 @@ typedef struct WHEPContext {
     char *session_url;
     int64_t pli_period;
     int64_t last_pli_time;
+    int64_t read_timeout;
 
     // libdatachannel state
     int pc;
@@ -190,7 +192,12 @@ static RTPDemuxContext *whep_new_rtp_context(AVFormatContext *s, int payload_typ
     if (st->codecpar->sample_rate > 0)
         st->time_base = (AVRational){1, st->codecpar->sample_rate};
 
-    rtp_ctx = ff_rtp_parse_open(s, st, payload_type, RTP_REORDER_QUEUE_DEFAULT_SIZE);
+    /* WHEP data-channel RTP arrives as one message per packet (~600+ msg/s
+     * for 1080p30). The default reorder queue (500) overflows whenever the
+     * demuxer is briefly slow (first frame, hwdec init, VO resize), dropping
+     * packets -> corrupted reference frames -> tearing that only heals on the
+     * next keyframe. Use a deeper reorder queue for WHEP. */
+    rtp_ctx = ff_rtp_parse_open(s, st, payload_type, 2000);
     if (!rtp_ctx) {
         av_log(s, AV_LOG_ERROR, "Failed to open RTP context\n");
         goto fail;
@@ -280,8 +287,18 @@ static int whep_read_header(AVFormatContext *s)
     ff_whip_whep_init_rtc_logger();
     s->ctx_flags |= AVFMTCTX_NOHEADER;
 
-    whep->capacity = 1024;
+    /* datachannel message queue: one slot per RTP packet. 8192 slots
+     * (~13s at 600 msg/s) absorbs demuxer stalls without dropping packets
+     * ("Message buffer is full" -> lost RTP -> torn frames). */
+    whep->capacity = 8192;
     whep->buffer = av_calloc(whep->capacity, sizeof(*whep->buffer));
+    /* WHEP first IDR often precedes the in-band parameter sets, so the
+     * probing decoder cannot emit a frame and avformat_find_stream_info()
+     * would otherwise stall for the default 5s analyze window, keeping the
+     * demux thread hot while the player thread opens the decoder (talloc
+     * race -> crash in ta_set_parent). Resolution is populated from the
+     * cached SPS, so a short analyze window is sufficient. */
+    s->max_analyze_duration = 500000;
     if (!whep->buffer) {
         av_log(s, AV_LOG_ERROR, "Failed to allocate message buffer\n");
         return AVERROR(ENOMEM);
@@ -324,6 +341,7 @@ static int whep_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     WHEPContext *whep = s->priv_data;
     int current_head, current_tail, ret = 0;
+    int64_t wait_start = 0;
     Message *msg = NULL;
     RTPDemuxContext *rtp_ctx = NULL;
     AVIOContext *dyn_bc = NULL;
@@ -337,17 +355,50 @@ redo:
     if (msg) {
         av_free(msg->data);
         av_free(msg);
-    }
-    if (rtcIsClosed(whep->audio_track) || rtcIsClosed(whep->video_track)) {
-        av_log(s, AV_LOG_ERROR, "Connection closed\n");
-        return AVERROR_EOF;
+        msg = NULL;
     }
 
-    current_head = atomic_load_explicit(&whep->head, memory_order_relaxed);
-    current_tail = atomic_load_explicit(&whep->tail, memory_order_acquire);
+    /* Block until the next datachannel message is queued.
+     *
+     * Returning AVERROR(EAGAIN) on an empty queue only works for callers
+     * that retry forever: ffplay and ffmpeg sleep ~10ms and read again.
+     * mpv's demux_lavf instead gives up after 10 consecutive av_read_frame()
+     * failures ("...treating it as fatal error." -> EOF). The queue is
+     * drained completely between two RTP packets (~33ms apart at 30fps), so
+     * those 10 retries are burned in well under a millisecond and playback
+     * dies right after the first frame. A live demuxer is expected to block,
+     * so wait here, honouring the interrupt callback so the caller can still
+     * abort, and give up only after read_timeout without any packet. */
+    for (;;) {
+        if (rtcIsClosed(whep->audio_track) || rtcIsClosed(whep->video_track)) {
+            av_log(s, AV_LOG_ERROR, "Connection closed\n");
+            return AVERROR_EOF;
+        }
 
-    if (current_head == current_tail)  // empty
-        return AVERROR(EAGAIN);
+        current_head = atomic_load_explicit(&whep->head, memory_order_relaxed);
+        current_tail = atomic_load_explicit(&whep->tail, memory_order_acquire);
+        if (current_head != current_tail)  // not empty
+            break;
+
+        if (ff_check_interrupt(&s->interrupt_callback))
+            return AVERROR_EXIT;
+
+        if (whep->read_timeout > 0) {
+            int64_t now = av_gettime_relative();
+            if (!wait_start) {
+                wait_start = now;
+            } else if (now - wait_start >= whep->read_timeout) {
+                av_log(s, AV_LOG_ERROR,
+                       "No RTP packet received for %"PRId64" ms, giving up\n",
+                       whep->read_timeout / 1000);
+                return AVERROR_EOF;
+            }
+        }
+
+        av_usleep(1000);
+    }
+    wait_start = 0;
+
     msg = whep->buffer[current_head];
     atomic_store_explicit(&whep->head, (current_head + 1) % whep->capacity,
                          memory_order_release);
@@ -432,9 +483,12 @@ redo:
     // Send PLI
     if (msg->track == whep->video_track && rtp_ctx->ssrc) {
         int64_t now = av_gettime_relative();
-        if ((whep->pli_period && now - whep->last_pli_time >= whep->pli_period * 1000000) ||
-            (rtp_ctx->handler && rtp_ctx->handler->need_keyframe &&
-            rtp_ctx->handler->need_keyframe(rtp_ctx->dynamic_protocol_context))) {
+        int need_kf = rtp_ctx->handler && rtp_ctx->handler->need_keyframe ?
+                      rtp_ctx->handler->need_keyframe(rtp_ctx->dynamic_protocol_context) : 0;
+        /* throttle PLI: at most one every 250ms even when need_keyframe stays set */
+        if (now - whep->last_pli_time >= 250 * 1000 &&
+            ((whep->pli_period && now - whep->last_pli_time >= whep->pli_period * 1000000) ||
+             need_kf)) {
             uint32_t source_ssrc = rtp_ctx->ssrc;
             uint32_t sender_ssrc = source_ssrc + 1;
             uint8_t pli_packet[] = {
@@ -442,6 +496,8 @@ redo:
                 sender_ssrc >> 24,      sender_ssrc >> 16, sender_ssrc >> 8, sender_ssrc,
                 source_ssrc >> 24,      source_ssrc >> 16, source_ssrc >> 8, source_ssrc,
             };
+            av_log(s, AV_LOG_VERBOSE, "whep: sending PLI (need_keyframe=%d, pli_period=%"PRId64")\n",
+                   need_kf, whep->pli_period);
             if (rtcSendMessage(msg->track, pli_packet, sizeof(pli_packet)) < 0)
                 av_log(s, AV_LOG_ERROR, "Failed to send PLI\n");
             else
@@ -523,7 +579,9 @@ static const AVOption whep_options[] = {
     { "token", "set token to send in the Authorization header as \"Bearer <token>\"",
         OFFSET(token), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_DECODING_PARAM },
     { "pli_period", "set interval in seconds for sending periodic PLI (Picture Loss Indication) requests; 0 to disable",
-        OFFSET(pli_period), AV_OPT_TYPE_INT64, {.i64 = 0 }, 0, INT64_MAX, AV_OPT_FLAG_DECODING_PARAM },
+        OFFSET(pli_period), AV_OPT_TYPE_INT64, {.i64 = 2 }, 0, INT64_MAX, AV_OPT_FLAG_DECODING_PARAM },
+    { "read_timeout", "maximum time in microseconds to wait for the next RTP packet before reporting end of stream; 0 to wait indefinitely",
+        OFFSET(read_timeout), AV_OPT_TYPE_INT64, {.i64 = 10000000 }, 0, INT64_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { NULL }
 };
 
@@ -534,14 +592,54 @@ static const AVClass whep_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
+static int whep_probe(const AVProbeData *p)
+{
+    if (p->filename && av_strstart(p->filename, "whep://", NULL))
+        return AVPROBE_SCORE_MAX / 2;
+    return 0;
+}
+
 const FFInputFormat ff_whep_demuxer = {
     .p.name         = "whep",
     .p.long_name    = NULL_IF_CONFIG_SMALL("WHEP (WebRTC-HTTP Egress Protocol)"),
     .p.flags        = AVFMT_NOFILE,
     .p.priv_class   = &whep_class,
+    .read_probe     = whep_probe,
     .priv_data_size = sizeof(WHEPContext),
     .read_header    = whep_read_header,
     .read_packet    = whep_read_packet,
     .read_close     = whep_read_close,
     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
+};
+
+static int whep_url_open(URLContext *h, const char *url, int flags)
+{
+    if (!av_strstart(url, "whep://", NULL)) {
+        av_log(h, AV_LOG_ERROR, "Unsupported URL scheme\n");
+        return AVERROR(EINVAL);
+    }
+    /* The SDP exchange and media transport are handled by the WHEP demuxer,
+     * which expects an HTTP(S) URL. Convert "whep://" to "http://" here. */
+    h->priv_data = av_asprintf("http://%s", url + strlen("whep://"));
+    if (!h->priv_data)
+        return AVERROR(ENOMEM);
+    return 0;
+}
+
+static int whep_url_read(URLContext *h, unsigned char *buf, int size)
+{
+    return AVERROR_EOF;
+}
+
+static int whep_url_close(URLContext *h)
+{
+    av_freep(&h->priv_data);
+    return 0;
+}
+
+const URLProtocol ff_whep_protocol = {
+    .name      = "whep",
+    .url_open  = whep_url_open,
+    .url_read  = whep_url_read,
+    .url_close = whep_url_close,
 };
